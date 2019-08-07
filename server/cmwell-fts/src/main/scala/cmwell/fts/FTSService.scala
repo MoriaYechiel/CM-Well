@@ -222,9 +222,11 @@ class FTSService(config: Config) extends NsSplitter{
     val fields = "system.kind" :: "system.path" :: "system.uuid" :: "system.lastModified" :: "content.length" ::
       "content.mimeType" :: "link.to" :: "link.kind" :: "system.dc" :: "system.indexTime" :: "system.quad" :: "system.current" :: Nil
 
+    val include : Array[String] = Array[String]("system.*", "content.mimeType", "content.length", "link.to", "link.kind")
+
     val request = client
-      .prepareSearch(s"${partition}_all")
-      .storedFields(fields:_*)
+      .prepareSearch(s"${partition}_all").setFetchSource(include, Array.empty[String])
+      //.storedFields(fields:_*)
       .setFrom(paginationParams.offset)
       .setSize(paginationParams.length)
       .setTrackTotalHits(true)
@@ -394,7 +396,10 @@ class FTSService(config: Config) extends NsSplitter{
       .setSize(paginationParams.length)
       .setTrackTotalHits(true)
 
-    val request = if (storedFields.nonEmpty) requestTmp.storedFields(storedFields: _*)
+    val request = if (storedFields.nonEmpty) {
+      val include : Array[String] = Array[String](storedFields:_*)
+      requestTmp.setFetchSource(include ++ fieldsFromSource, Array.empty[String])//.storedFields(storedFields: _*)
+    }
     else requestTmp.setFetchSource(fieldsFromSource, Array.empty[String])
 
     applySortToRequest(sortParams, request)
@@ -634,8 +639,9 @@ class FTSService(config: Config) extends NsSplitter{
     val fields = "system.kind" :: "system.path" :: "system.uuid" :: "system.lastModified" :: "content.length" ::
       "content.mimeType" :: "link.to" :: "link.kind" :: "system.dc" :: "system.indexTime" :: "system.quad" :: "system.current" :: Nil
 
-    val request = clients.getOrElse(nodeId,client).prepareSearch(index)
-      .storedFields(fields:_*)
+    val include : Array[String] = Array[String](fields:_*)
+
+    val request = clients.getOrElse(nodeId,client).prepareSearch(index).setFetchSource(include, Array[String]())
       .setScroll(TimeValue.timeValueSeconds(scrollTTL))
       .setSize(length)
       .setFrom(offset)
@@ -730,7 +736,8 @@ class FTSService(config: Config) extends NsSplitter{
     val indices = if (indexNames.nonEmpty) indexNames else Seq(s"${partition}_all")
     val request = client
       .prepareSearch(indices: _*)
-      .storedFields(fields: _*)
+      .setFetchSource(Array[String](fields:_*),Array[String]())
+      //.storedFields(fields: _*)
       .setScroll(TimeValue.timeValueSeconds(scrollTTL))
       .setSize(paginationParams.length)
       .addSort("_doc", SortOrder.ASC)
@@ -1109,7 +1116,8 @@ class FTSService(config: Config) extends NsSplitter{
     // since in ES scroll API, size is per shard, we need to convert our paginationParams.length parameter to be per shard
     // We need to find how many shards are relevant for this query. For that we'll issue a fake search request
     // TODO: fix should add indexTime, so why not pull it now?
-    val fakeRequest = client.prepareSearch(alias).storedFields("system.uuid","system.lastModified").setTrackTotalHits(true)
+    //val fakeRequest = client.prepareSearch(alias).storedFields("system.uuid","system.lastModified").setTrackTotalHits(true)
+    val fakeRequest = client.prepareSearch(alias).setFetchSource(Array[String]("system.uuid","system.lastModified"),Array[String]()).setTrackTotalHits(true)
 
     fakeRequest.setQuery(QueryBuilders.matchQuery("system.path", path))
 
@@ -1121,7 +1129,7 @@ class FTSService(config: Config) extends NsSplitter{
 
       val request = client
         .prepareSearch(alias)
-        .storedFields("system.uuid","system.lastModified")
+        .setFetchSource(Array[String]("system.uuid","system.lastModified"), Array[String]())
         .setScroll(TimeValue.timeValueSeconds(scrollTTL))
         .setSize(infotonsPerShard)
         .setQuery(QueryBuilders.matchQuery("system.path", path))
@@ -1157,8 +1165,15 @@ class FTSService(config: Config) extends NsSplitter{
     if (sHits.isEmpty) Vector.empty
     else {
       sHits.map{ hit =>
-        val uuid = hit.field("system.uuid").getValue[String]
-        val lastModified = new DateTime(hit.field("system.lastModified").getValue[String]).getMillis
+        //scalastyle:off
+        //loger.info(s"MORIA hit: $hit")
+        //MORIA refactor
+        val source = hit.getSourceAsMap
+        val myMap = source.get("system").asInstanceOf[java.util.HashMap[String, String]]
+        //scalastyle:on
+
+        val uuid = myMap.get("uuid")
+        val lastModified = new DateTime(myMap.get("lastModified")).getMillis
         val index = hit.getIndex
         (lastModified, uuid, index)
       }(collection.breakOut)
@@ -1171,7 +1186,8 @@ class FTSService(config: Config) extends NsSplitter{
 
     val request = client
       .prepareSearch(s"${partition}_all")
-      .storedFields("system.uuid")
+      .setFetchSource(Array[String]("system.uuid"), Array[String]())
+      //.storedFields("system.uuid")
       .setFrom(paginationParams.offset).setSize(paginationParams.length)
       .setTrackTotalHits(true)
 
@@ -1210,7 +1226,18 @@ class FTSService(config: Config) extends NsSplitter{
     if (esResponse.getHits.getHits().nonEmpty) {
       val hits = esResponse.getHits.getHits()
       hits.map { hit =>
-        val uuid = hit.field("system.uuid").getValue[String]
+        //scalastyle:off
+        //loger.info(s"MORIA hit: $hit")
+        val source = hit.getSourceAsMap
+        val myMap = source.get("system").asInstanceOf[java.util.HashMap[String, String]]
+        /*val system = source.get("system").toString.replace("{", "").replace("}", "")
+
+        val myMap = system.split(", ").map(pair => {
+          val sub = pair.split("=")
+          (sub(0), sub(1))
+        }).toMap*/
+        //scalastyle:on
+        val uuid = myMap.get("uuid")
         val index = hit.getIndex
         (uuid, index)
       }.toVector
@@ -1220,7 +1247,16 @@ class FTSService(config: Config) extends NsSplitter{
   }
 
   private def getValueAs[T](hit: SearchHit, fieldName: String): Try[T] = {
+    //loger.info(s"MORIA contentLength: ${hit.field(fieldName)}")
     Try[T](hit.field(fieldName).getValue[T])
+  }
+
+  private def getValueAsLong[T](value: String): Try[Long] = {
+    Try[Long](value.toLong)
+  }
+
+  private def getValueAsInt[T](value: String): Try[Int] = {
+    Try[Int](value.toInt)
   }
 
   private def tryLongThenInt[V](hit: SearchHit,
@@ -1245,6 +1281,27 @@ class FTSService(config: Config) extends NsSplitter{
       }
     }
 
+  private def tryLongThenIntN[V](value: String,
+                                f: Long => V,
+                                default: V,
+                                uuid: String,
+                                pathForLog: String)(implicit logger: Logger = loger): V =
+    try {
+      getValueAsLong[Long](value) match {
+        case Success(l) => f(l)
+        case Failure(e) => {
+          e.setStackTrace(Array.empty) // no need to fill the logs with redundant stack trace
+          logger.trace(s"$value not Long (outer), uuid = $uuid, path = $pathForLog", e)
+          tryIntN(value, f, default, uuid)
+        }
+      }
+    } catch {
+      case e: Throwable => {
+        logger.trace(s"$value not Long (inner), uuid = $uuid", e)
+        tryIntN(value, f, default, uuid)
+      }
+    }
+
   private def tryInt[V](hit: SearchHit, fieldName: String, f: Long => V, default: V, uuid: String)(
     implicit logger: Logger = loger
   ): V =
@@ -1263,23 +1320,55 @@ class FTSService(config: Config) extends NsSplitter{
       }
     }
 
+  private def tryIntN[V](value: String, f: Long => V, default: V, uuid: String)(
+    implicit logger: Logger = loger
+  ): V =
+    try {
+      getValueAsInt[Int](value) match {
+        case Success(i) => f(i.toLong)
+        case Failure(e) => {
+          logger.error(s"$value not Int (outer), uuid = $uuid", e)
+          default
+        }
+      }
+    } catch {
+      case e: Throwable => {
+        logger.error(s"$value not Int (inner), uuid = $uuid", e)
+        default
+      }
+    }
+
   private val memoizedBreakoutForEsResponseToThinInfotons = scala.collection.breakOut[Array[SearchHit],FTSThinInfoton,Vector[FTSThinInfoton]]
   private def esResponseToThinInfotons(esResponse: org.elasticsearch.action.search.SearchResponse, includeScore: Boolean): Seq[FTSThinInfoton] = {
     esResponse.getHits.getHits().map { hit =>
-      val path = hit.field("system.path").getValue[String]
-      val uuid = hit.field("system.uuid").getValue[String]
-      val lastModified = hit.field("system.lastModified").getValue[String]
-      val indexTime = tryLongThenInt[Long](hit,"system.indexTime",identity,-1L,uuid,path)
+      //scalastyle:off
+      //loger.info(s"MORIA hit: $hit")
+      val source = hit.getSourceAsMap
+      val myMap = source.get("system").asInstanceOf[java.util.HashMap[String, String]]
+      //scalastyle:on
+
+      val path = myMap.get("path")
+      val uuid = myMap.get("uuid")
+      val lastModified = myMap.get("lastModified")
+      //val indexTime = tryLongThenIntN[Long](myMap.get("indexTime"), identity, -1L, uuid, path)
+      val indexTime = myMap.get("indexTime").asInstanceOf[Long]
       val score = if(includeScore) Some(hit.getScore()) else None
       FTSThinInfoton(path, uuid, lastModified, indexTime, score)
     }(memoizedBreakoutForEsResponseToThinInfotons)
   }
 
   private def esGetResponseToThinInfotons(esResponse: org.elasticsearch.action.get.GetResponse): FTSThinInfoton = {
-    val path = esResponse.getField("system.path").getValue[String]
-    val uuid = esResponse.getField("system.uuid").getValue[String]
-    val lastModified = esResponse.getField("system.lastModified").getValue[String]
-    val indexTime = esResponse.getField("system.indexTime").getValue[Long]
+    //scalastyle:off
+    //loger.info(s"MORIA esResponse: $esResponse")
+    val source = esResponse.getSourceAsMap
+    val myMap = source.get("system").asInstanceOf[java.util.HashMap[String, String]]
+    //scalastyle:on
+
+    val path = myMap.get("path")
+    val uuid = myMap.get("uuid")
+    val lastModified = myMap.get("lastModified")
+    //val indexTime = tryLongThenIntN[Option[Long]](myMap.get("indexTime"), Some.apply[Long], None, uuid, path).get
+    val indexTime = myMap.get("indexTime").asInstanceOf[Long]
     FTSThinInfoton(path, uuid, lastModified, indexTime, None)
   }
 
@@ -1289,25 +1378,43 @@ class FTSService(config: Config) extends NsSplitter{
     if (esResponse.getHits.getHits().nonEmpty) {
       val hits = esResponse.getHits.getHits()
       hits.map { hit =>
-        val path = hit.field("system.path").getValue[String]
-        val x = hit.field("system.lastModified")
-        x.getValue
-        val lastModified = new DateTime(hit.field("system.lastModified").getValue[String])
-        val id = hit.field("system.uuid").getValue[String]
-        val dc = Try(hit.field("system.dc").getValue[String]).getOrElse(dataCenter)
-        val protocol = Try(hit.field("system.protocol").getValue[String]).toOption
-        val indexTime = tryLongThenInt[Option[Long]](hit, "system.indexTime", Some.apply[Long], None, id, path)
+        //scalastyle:off
+        //loger.info(s"MORIA hit: $hit")
+        val source = hit.getSourceAsMap
+        val myMap = source.get("system").asInstanceOf[java.util.HashMap[String, Object]]
+        //myMap.forEach(aa: (String, Object) => //loger.info(s"MORIA instance in map: ${aa._1}"))
+        //loger.info(s"MORIA map type: ${myMap.getClass.getCanonicalName}  map: $myMap")
+
+        //scalastyle:on
+        val path = myMap.get("path").asInstanceOf[String]
+        /*val x = hit.field("system.lastModified")
+        x.getValue*/
+        val lastModified = new DateTime(myMap.get("lastModified"))
+        val id = myMap.get("uuid").asInstanceOf[String]
+        val dc = Try(myMap.get("dc").asInstanceOf[String]).getOrElse(dataCenter)
+        val protocol = Try(myMap.get("protocol").asInstanceOf[String]).toOption
+        //val indexTime = tryLongThenIntN[Option[Long]](myMap.get("indexTime").asInstanceOf[Long], Some.apply[Long], None, id, path)
+        /*val it = myMap.get("indexTime")
+        val indexTime =  it match {
+          case Long => Some(it)
+          case _ => None
+        }*/
+        val indexTime = Try(myMap.get("indexTime").asInstanceOf[Long]).toOption
         val score: Option[Map[String, Set[FieldValue]]] =
           if (includeScore) Some(Map("$score" -> Set(FExtra(hit.getScore(), sysQuad)))) else None
 
-        hit.field("system.kind").getValue[String] match {
+        //loger.info(s"MORIA indexTime: $indexTime")
+
+        myMap.get("kind") match {
           case "ObjectInfoton" =>
             new ObjectInfoton(path, dc, indexTime, lastModified, score, protocol = protocol) {
               override def uuid = id
               override def kind = "ObjectInfoton"
             }
           case "FileInfoton" =>
-            val contentLength = tryLongThenInt[Long](hit, "content.length", identity, -1L, id, path)
+            val myContent = source.get("content").asInstanceOf[java.util.HashMap[String, String]]
+            //val contentLength = tryLongThenIntN[Option[Long]](myContent.get("length"), Some.apply[Long], None, id, path)
+            val contentLength = Try(myContent.get("length").asInstanceOf[Int]).toOption
 
             new FileInfoton(
               path,
@@ -1315,19 +1422,26 @@ class FTSService(config: Config) extends NsSplitter{
               indexTime,
               lastModified,
               score,
-              Some(FileContent(hit.field("content.mimeType").getValue[String], contentLength)),
+              Some(FileContent(myContent.get("mimeType"), contentLength.get)),
               protocol = protocol) {
               override def uuid = id
               override def kind = "FileInfoton"
             }
           case "LinkInfoton" =>
+            val myLink = source.get("link").asInstanceOf[java.util.HashMap[String, String]]
+
+            val kind = myLink.get("kind").toInt
+
+            //loger.info(s"MORIA kind: $kind")
+            //loger.info(s"MORIA to: ${myLink("to")}")
+
             new LinkInfoton(path,
               dc,
               indexTime,
               lastModified,
               score,
-              hit.field("link.to").getValue[String],
-              hit.field("link.kind").getValue[Int],
+              myLink.get("to"),
+              kind,
               protocol = protocol) {
               override def uuid = id
               override def kind = "LinkInfoton"
@@ -1587,10 +1701,17 @@ class FTSService(config: Config) extends NsSplitter{
     val req = client.prepareGet()
       .setIndex(indexName)
       .setId(uuid)
-      .setStoredFields(fields: _*)
+      .setFetchSource(Array[String](fields:_*),Array[String]())
+      //.setStoredFields(fields: _*)
+
     injectFuture[GetResponse](req.execute).map { gr =>
       if (gr.isExists) {
-        val isCurrent = gr.getField("system.current").getValue[Boolean]
+        //scalastyle:off
+        //loger.info(s"MORIA gr: $gr")
+        val source = gr.getSourceAsMap
+        val myMap = source.get("system").asInstanceOf[java.util.HashMap[String, Object]]
+        //scalastyle:on
+        val isCurrent = myMap.get("current").asInstanceOf[Boolean]
         Some(esGetResponseToThinInfotons(gr) -> isCurrent)
       }
       else None
@@ -1605,7 +1726,8 @@ class FTSService(config: Config) extends NsSplitter{
                           , fieldFilters: Option[FieldFilter])(implicit executionContext: ExecutionContext): Future[Option[Long]] = {
     val request = client
       .prepareSearch(s"${partition}_all")
-      .storedFields("system.indexTime")
+      //.storedFields("system.indexTime")
+      .setFetchSource(Array[String]("system.indexTime"), Array[String]())
       .setSize(1)
       .addSort("system.indexTime", SortOrder.DESC)
       .setTrackTotalHits(true)
@@ -1622,7 +1744,17 @@ class FTSService(config: Config) extends NsSplitter{
       withHistory = withHistory
     )
     logRequest("getLastIndexTimeFor", s"dc: $dc")
-    injectFuture[SearchResponse](request.execute).map(_.getHits.getHits.headOption.map(_.getFields.get("system.indexTime").getValue[Long]))
+    injectFuture[SearchResponse](request.execute).map(_.getHits.getHits.headOption.map{
+      res =>
+        //scalastyle:off
+        //loger.info(s"MORIA hit: $res")
+        val source = res.getSourceAsMap
+        val myMap = source.get("system").asInstanceOf[java.util.HashMap[String, String]]
+        //scalastyle:on
+        /*tryLongThenIntN[Option[Long]](myMap.get("indexTime"), Some.apply[Long], None,
+          "No id, getLastTimeIndexTimeFor", "\"No id, getLastTimeIndexTimeFor\"").get*/
+        myMap.get("indexTime").asInstanceOf[Long]
+    })
   }
 
   def purgeByUuidsFromAllIndexes(uuids: Vector[String], partition: String = defaultPartition)
